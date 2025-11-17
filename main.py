@@ -65,7 +65,7 @@ def home():
 @app.get("/tasks", response_model=List[Task])
 def get_tasks():
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = sqlite3.Row  # Важно для получения данных как словаря
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM tasks")
     tasks = cursor.fetchall()
@@ -82,10 +82,19 @@ def create_task(task: TaskBase):
     )
     conn.commit()
     task_id = cursor.lastrowid
+    
+    # ВАЖНО: устанавливаем row_factory ПЕРЕД получением данных
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
     cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
     new_task = cursor.fetchone()
     conn.close()
-    return dict(new_task)
+    
+    # Безопасное преобразование в словарь
+    if new_task:
+        return dict(new_task)
+    else:
+        raise HTTPException(status_code=404, detail="Задача не найдена после создания")
 
 @app.put("/tasks/{task_id}", response_model=Task)
 def update_task(task_id: int, task: TaskBase):
@@ -96,9 +105,14 @@ def update_task(task_id: int, task: TaskBase):
         (task.title, task.description, task.completed, task_id)
     )
     conn.commit()
+    
+    # ВАЖНО: устанавливаем row_factory ПЕРЕД получением данных
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
     cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
     updated_task = cursor.fetchone()
     conn.close()
+    
     if updated_task:
         return dict(updated_task)
     raise HTTPException(status_code=404, detail="Задача не найдена")
@@ -109,7 +123,9 @@ def delete_task(task_id: int):
     cursor = conn.cursor()
     cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     conn.commit()
-    if cursor.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Задача не найдена")
+    rows_affected = cursor.rowcount
     conn.close()
+    
+    if rows_affected == 0:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
     return {"message": f"Задача {task_id} успешно удалена"}
