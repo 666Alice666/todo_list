@@ -1,93 +1,115 @@
-from flask import Flask, jsonify, request
-from flask_sqlalchemy import SQLAlchemy
-from flask_migrate import Migrate
 import os
-from datetime import datetime
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+import sqlite3
+import uvicorn
 
-app = Flask(__name__)
+app = FastAPI(title="Todo List API")
 
-# Конфигурация базы данных
-DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://user:password@localhost:5432/todo_db')
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# CORS для Postman
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# Путь к БД для Render.com
+DB_PATH = "/tmp/todo.db"
 
-db = SQLAlchemy(app)
-migrate = Migrate(app, db)
-
-# Модель задачи
-class Task(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(100), nullable=False)
-    description = db.Column(db.Text, nullable=True)
-    completed = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'title': self.title,
-            'description': self.description,
-            'completed': self.completed,
-            'created_at': self.created_at.isoformat()
-        }
-
-# Создание базы данных
-@app.before_first_request
-def create_tables():
-    db.create_all()
-
-# Получение всех задач
-@app.route('/tasks', methods=['GET'])
-def get_tasks():
-    tasks = Task.query.all()
-    return jsonify([task.to_dict() for task in tasks])
-
-# Создание новой задачи
-@app.route('/tasks', methods=['POST'])
-def create_task():
-    data = request.get_json()
-    
-    if not data or not 'title' in data:
-        return jsonify({'error': 'Title is required'}), 400
-    
-    task = Task(
-        title=data['title'],
-        description=data.get('description', ''),
-        completed=data.get('completed', False)
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        description TEXT,
+        completed BOOLEAN DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
-    
-    db.session.add(task)
-    db.session.commit()
-    
-    return jsonify(task.to_dict()), 201
+    """)
+    conn.commit()
+    conn.close()
 
-# Обновление задачи
-@app.route('/tasks/<int:task_id>', methods=['PUT'])
-def update_task(task_id):
-    task = Task.query.get_or_404(task_id)
-    data = request.get_json()
-    
-    if 'title' in data:
-        task.title = data['title']
-    if 'description' in data:
-        task.description = data['description']
-    if 'completed' in data:
-        task.completed = data['completed']
-    
-    db.session.commit()
-    return jsonify(task.to_dict())
+# Инициализация БД при старте
+init_db()
 
-# Удаление задачи
-@app.route('/tasks/<int:task_id>', methods=['DELETE'])
-def delete_task(task_id):
-    task = Task.query.get_or_404(task_id)
-    db.session.delete(task)
-    db.session.commit()
-    return jsonify({'message': f'Task {task_id} has been deleted'})
+class TaskBase(BaseModel):
+    title: str
+    description: Optional[str] = None
+    completed: bool = False
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+class Task(TaskBase):
+    id: int
+
+    class Config:
+        from_attributes = True
+
+@app.get("/")
+def home():
+    return {
+        "status": "API работает!",
+        "service": "Todo List",
+        "endpoints": {
+            "GET /tasks": "Получить все задачи",
+            "POST /tasks": "Создать задачу",
+            "PUT /tasks/{id}": "Обновить задачу",
+            "DELETE /tasks/{id}": "Удалить задачу"
+        }
+    }
+
+@app.get("/tasks", response_model=List[Task])
+def get_tasks():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM tasks")
+    tasks = cursor.fetchall()
+    conn.close()
+    return [dict(task) for task in tasks]
+
+@app.post("/tasks", response_model=Task, status_code=201)
+def create_task(task: TaskBase):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO tasks (title, description, completed) VALUES (?, ?, ?)",
+        (task.title, task.description, task.completed)
+    )
+    conn.commit()
+    task_id = cursor.lastrowid
+    cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    new_task = cursor.fetchone()
+    conn.close()
+    return dict(new_task)
+
+@app.put("/tasks/{task_id}", response_model=Task)
+def update_task(task_id: int, task: TaskBase):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE tasks SET title = ?, description = ?, completed = ? WHERE id = ?",
+        (task.title, task.description, task.completed, task_id)
+    )
+    conn.commit()
+    cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    updated_task = cursor.fetchone()
+    conn.close()
+    if updated_task:
+        return dict(updated_task)
+    raise HTTPException(status_code=404, detail="Задача не найдена")
+
+@app.delete("/tasks/{task_id}")
+def delete_task(task_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    conn.commit()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    conn.close()
+    return {"message": f"Задача {task_id} успешно удалена"}
